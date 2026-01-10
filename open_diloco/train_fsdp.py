@@ -169,9 +169,15 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> S
 
 
 def get_model(config: Config) -> LlamaForCausalLM:
-    # Load model
+    # Load model with GPU-direct to avoid system RAM OOM (32GB limit)
     config_model = LlamaConfig.from_pretrained(config.path_model, attn_implementation=config.attn_implementation)
-    return LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path=config.path_model, config=config_model)
+    return LlamaForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=config.path_model,
+        config=config_model,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,  # Critical for 32GB RAM systems
+        device_map=None  # FSDP handles device placement
+    )
 
 
 def train(config: Config):
