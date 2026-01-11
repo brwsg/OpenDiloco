@@ -174,7 +174,6 @@ def get_model(config: Config) -> LlamaForCausalLM:
     return LlamaForCausalLM.from_pretrained(
         pretrained_model_name_or_path=config.path_model,
         config=config_model,
-        torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,  # Critical for 32GB RAM systems
         device_map=None  # FSDP handles device placement
     )
