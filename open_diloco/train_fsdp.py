@@ -60,6 +60,13 @@ from open_diloco.utils import (
     register_metrics_hooks,
 )
 
+from open_diloco.diagnostics import (
+    diag_snapshot,
+    enable_faulthandler,
+    enforce_min_shm_free_gib,
+    start_periodic_snapshots,
+)
+
 
 TIMEOUT_NCCL_MINUTES = os.environ.get("TIMEOUT_NCCL_MINUTES", 120)
 TARGET_LAYER_ACTIVATIONS = ["self_attn", "lm_head"]
@@ -70,6 +77,7 @@ TEST_VOCAB_SIZE = 1024
 def ddp_setup():
     init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=TIMEOUT_NCCL_MINUTES))
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    diag_snapshot("ddp_setup_done")
 
 
 def log(message):
@@ -180,10 +188,30 @@ def get_model(config: Config) -> LlamaForCausalLM:
 
 
 def train(config: Config):
+    enable_faulthandler()
+
     sharding_strategy = get_sharding_strategy(config.sharding_strategy)
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
+
+    diag_snapshot(
+        "train_start",
+        extra={
+            "world_size": world_size,
+            "path_model": config.path_model,
+            "seq_length": config.seq_length,
+            "total_batch_size": config.total_batch_size,
+            "per_device_train_batch_size": config.per_device_train_batch_size,
+            "precision": config.precision,
+            "hv_enabled": config.hv is not None,
+            "hv_world_rank": getattr(config.hv, "world_rank", None),
+            "hv_galaxy_size": getattr(config.hv, "galaxy_size", None),
+        },
+    )
+
+    enforce_min_shm_free_gib()
+    start_periodic_snapshots(interval_s=float(os.environ.get("OPEN_DILOCO_DIAG_INTERVAL_S", "10")))
 
     world_messenger_hv = config.hv is not None and local_rank == 0
 
@@ -208,6 +236,14 @@ def train(config: Config):
         log("hivemind diloco enabled")
 
     if world_messenger_hv:
+        diag_snapshot(
+            "before_dht_start",
+            extra={
+                "initial_peers": config.hv.initial_peers,
+                "host_maddrs": config.hv.host_maddrs,
+                "announce_maddrs": config.hv.announce_maddrs,
+            },
+        )
         dht = DHT(
             start=True,
             initial_peers=config.hv.initial_peers,
@@ -215,6 +251,7 @@ def train(config: Config):
             announce_maddrs=config.hv.announce_maddrs,
         )
         log_visible_maddrs(dht.get_visible_maddrs(), only_p2p=False)
+        diag_snapshot("after_dht_start")
 
     if local_rank == 0:
         check_checkpoint_path_access(config.ckpt.path, rank, config.hv.world_rank if config.hv else None)
@@ -226,6 +263,7 @@ def train(config: Config):
     train_dataloader = get_dataloader(tokenizer, world_size, rank, local_rank, config)
 
     model = get_model(config)
+    diag_snapshot("model_loaded")
     model = model.to(local_rank)
 
     half_precision = config.precision == "fp16-mixed" or config.precision == "bf16-mixed"
@@ -310,6 +348,7 @@ def train(config: Config):
             diloco_args["matchmaking_time"] = config.hv.matchmaking_time
 
         optimizer = DiLoCoOptimizer(**diloco_args)
+        diag_snapshot("diloco_optimizer_initialized")
 
         scheduler = scheduler_fn(
             optimizer.inner_optimizer
@@ -351,7 +390,9 @@ def train(config: Config):
     model.train()
 
     if world_messenger_hv and not config.hv.skip_load_from_peers:
+        diag_snapshot("before_load_state_from_peers")
         optimizer.load_state_from_peers()
+        diag_snapshot("after_load_state_from_peers")
 
     current_time = time.time()
     log(f"starting from step {start_step}")

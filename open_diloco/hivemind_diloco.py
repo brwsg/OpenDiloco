@@ -557,6 +557,37 @@ class DiLoCoOptimizer(Optimizer):
 
         return loss
 
+    def load_state_from_peers(self, *args, **kwargs):
+        # Wrap parent implementation with lightweight diagnostics. This is useful
+        # for SIGBUS/SIGSEGV style failures that happen during large state transfer.
+        try:
+            from open_diloco.diagnostics import diag_snapshot
+
+            diag_snapshot(
+                "optimizer_before_load_state_from_peers",
+                extra={"run_id": getattr(self, "run_id", None), "auxiliary": getattr(self, "auxiliary", None)},
+            )
+        except Exception:
+            pass
+
+        t0 = time.time()
+        try:
+            return super().load_state_from_peers(*args, **kwargs)
+        finally:
+            try:
+                from open_diloco.diagnostics import diag_snapshot
+
+                diag_snapshot(
+                    "optimizer_after_load_state_from_peers",
+                    extra={
+                        "elapsed_s": round(time.time() - t0, 3),
+                        "run_id": getattr(self, "run_id", None),
+                        "auxiliary": getattr(self, "auxiliary", None),
+                    },
+                )
+            except Exception:
+                pass
+
     def _compute_schema_hash(self) -> int:
         """this function is similar to hivemind.Optimizer._compute_schema_hash
         but disregard the gradient buffers of the offloaded optimizer
