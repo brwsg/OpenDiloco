@@ -177,14 +177,24 @@ def get_dataloader(tokenizer, world_size, rank, local_rank, config: Config) -> S
 
 
 def get_model(config: Config) -> LlamaForCausalLM:
-    # Load model with GPU-direct to avoid system RAM OOM (32GB limit)
+    # Load model directly to GPU to avoid system RAM OOM
+    # With 96GB VRAM, everything should stay on GPU
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     config_model = LlamaConfig.from_pretrained(config.path_model, attn_implementation=config.attn_implementation)
-    return LlamaForCausalLM.from_pretrained(
+    
+    # Load with meta device first to avoid any CPU memory allocation
+    with torch.device('meta'):
+        model = LlamaForCausalLM(config_model)
+    
+    # Load weights directly to GPU
+    model = LlamaForCausalLM.from_pretrained(
         pretrained_model_name_or_path=config.path_model,
         config=config_model,
-        low_cpu_mem_usage=True,  # Critical for 32GB RAM systems
-        device_map=None  # FSDP handles device placement
+        torch_dtype=torch.bfloat16,  # Load in bf16 to save VRAM
+        device_map={"": f"cuda:{local_rank}"},  # Force all layers to GPU
+        low_cpu_mem_usage=True,
     )
+    return model
 
 
 def train(config: Config):
@@ -264,7 +274,7 @@ def train(config: Config):
 
     model = get_model(config)
     diag_snapshot("model_loaded")
-    model = model.to(local_rank)
+    # Model is already on GPU from get_model()
 
     half_precision = config.precision == "fp16-mixed" or config.precision == "bf16-mixed"
     half_precision_dtype = torch.bfloat16 if config.precision == "bf16-mixed" else torch.float16
