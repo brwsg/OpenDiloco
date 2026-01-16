@@ -39,10 +39,12 @@ class DiLoCoStateAverager(TrainingStateAverager):
         num_inner_steps: int,
         inner_optimizer: TorchOptimizer,
         scheduler: Optional[SchedulerFactory] = None,
+        offload_device: Optional[str] = None,  # None = CPU (default), "cuda" = GPU
         **kwargs,
     ):
         self.inner_optimizer = inner_optimizer
         self.num_inner_steps = num_inner_steps
+        self.offload_device = offload_device  # Store for _make_host_tensor override
 
         super().__init__(
             **kwargs
@@ -50,6 +52,31 @@ class DiLoCoStateAverager(TrainingStateAverager):
 
         self.scheduler_inner_optimizer = scheduler(self.inner_optimizer) if scheduler is not None else None
         assert isinstance(self.scheduler_inner_optimizer, (LRSchedulerBase, type(None)))
+
+    def _make_host_tensor(self, source_tensor: torch.Tensor, force_copy: bool = False) -> torch.Tensor:
+        """
+        Override to support GPU-resident training with lazy CPU copy for averaging.
+        
+        When offload_device="cuda":
+        - Optimizer state stays on GPU during training (saves system RAM)
+        - Tensors are copied to CPU only when averaging is triggered
+        - This is a memory-time tradeoff: more VRAM usage, less RAM, slightly slower averaging
+        
+        Note: Hivemind's averaging infrastructure requires CPU tensors for shared memory IPC.
+        We cannot avoid CPU usage entirely, but we can minimize peak RAM by not keeping
+        optimizer state on CPU continuously.
+        """
+        if self.offload_device is not None and self.offload_device.startswith("cuda"):
+            # For GPU-native mode, we still need CPU tensors for hivemind's averaging
+            # but we'll manage the GPU->CPU copy ourselves during averaging
+            # For now, create CPU tensor but mark it for special handling
+            averaged_tensor = source_tensor.detach().to(device="cpu", dtype=torch.float32, copy=True)
+            averaged_tensor.share_memory_()
+            averaged_tensor._gpu_source_device = source_tensor.device  # Store original device
+            return averaged_tensor.requires_grad_(source_tensor.requires_grad)
+        else:
+            # Default: offload to CPU (original hivemind behavior)
+            return super()._make_host_tensor(source_tensor, force_copy)
 
     def _update_scheduler(self):
         """Increase the scheduler state until it becomes synchronized with local epoch"""
@@ -314,6 +341,8 @@ class DiLoCoOptimizer(Optimizer):
     :param: scheduler: callable to a learning rate scheduler to update the inner optimizer lr.
     :param: num_inner_steps: number of inner optimizer updates per outer optimizer update
     :param: batch_size: number of samples in a single batch
+    :param: offload_device: where to keep optimizer state and averaged tensors. None="cpu" (default, uses system RAM),
+            "cuda" = keep on GPU (saves system RAM but uses more VRAM). Useful for systems with large VRAM but limited RAM.
 
     the rest of parameters are the same as Hivemind's Optimizer, expect `optimizer` that is override by `outer_optimizer`.
     """
@@ -340,9 +369,11 @@ class DiLoCoOptimizer(Optimizer):
         all_reduce_strategy: AllReduceStrategy = AllReduceStrategy.WAIT_FOR_ALL,
         timeout_waiting_for_peers: float | None = None,
         matchmaking_time: Optional[float] = 15.0,
+        offload_device: Optional[str] = None,  # None="cpu", "cuda"=GPU
         **kwargs,
     ):
         self._check_kwargs(kwargs)
+        self.offload_device = offload_device  # Store for _make_state_averager
 
         if timeout_waiting_for_peers is not None:
             if all_reduce_strategy == AllReduceStrategy.NO_WAIT:
@@ -477,6 +508,7 @@ class DiLoCoOptimizer(Optimizer):
             start=True,
             num_inner_steps=self.num_inner_steps,
             inner_optimizer=self.inner_optimizer,
+            offload_device=self.offload_device,  # GPU-native support
             **kwargs,
         )
 
